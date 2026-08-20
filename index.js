@@ -18,15 +18,15 @@ const {
   VoiceConnectionStatus,
   StreamType,
   entersState
+  
 } = require("@discordjs/voice");
 const youtubedl = require("youtube-dl-exec");
 
 const PORT = process.env.PORT || 10000;
 
-// Render Web Services need a listening HTTP port.
 http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("SB Music Bot is online.");
+  res.end("SB Music Bot is online");
 }).listen(PORT, "0.0.0.0", () => {
   console.log(`HTTP server listening on ${PORT}`);
 });
