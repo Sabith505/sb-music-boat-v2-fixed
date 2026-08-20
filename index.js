@@ -1,12 +1,14 @@
 require("dotenv").config();
 
+const http = require("http");
+const path = require("path");
+const { spawn } = require("child_process");
 const {
   Client,
   GatewayIntentBits,
   SlashCommandBuilder,
   ActivityType
 } = require("discord.js");
-
 const {
   joinVoiceChannel,
   createAudioPlayer,
@@ -17,8 +19,17 @@ const {
   StreamType,
   entersState
 } = require("@discordjs/voice");
-
 const youtubedl = require("youtube-dl-exec");
+
+const PORT = process.env.PORT || 10000;
+
+// Render Web Services need a listening HTTP port.
+http.createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("SB Music Bot is online.");
+}).listen(PORT, "0.0.0.0", () => {
+  console.log(`HTTP server listening on ${PORT}`);
+});
 
 const commands = [
   new SlashCommandBuilder()
@@ -41,10 +52,10 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates]
 });
 
-const guilds = new Map();
+const states = new Map();
 
-function getGuild(guildId) {
-  if (!guilds.has(guildId)) {
+function getState(guildId) {
+  if (!states.has(guildId)) {
     const player = createAudioPlayer({
       behaviors: { noSubscriber: NoSubscriberBehavior.Pause }
     });
@@ -57,10 +68,15 @@ function getGuild(guildId) {
       loop: false,
       volume: 80,
       resource: null,
-      sourceProcess: null
+      process: null
     };
 
     player.on(AudioPlayerStatus.Idle, () => {
+      if (state.process) {
+        try { state.process.kill("SIGKILL"); } catch {}
+        state.process = null;
+      }
+
       if (state.loop && state.current) {
         playCurrent(guildId).catch(console.error);
       } else {
@@ -69,10 +85,10 @@ function getGuild(guildId) {
       }
     });
 
-    player.on("error", e => console.error("Player error:", e));
-    guilds.set(guildId, state);
+    player.on("error", e => console.error("Audio player error:", e));
+    states.set(guildId, state);
   }
-  return guilds.get(guildId);
+  return states.get(guildId);
 }
 
 async function ensureConnection(interaction, state) {
@@ -91,7 +107,7 @@ async function ensureConnection(interaction, state) {
   }
 }
 
-async function ytInfo(query) {
+async function getTrack(query) {
   const target = /^https?:\/\/(www\.)?(youtube\.com|youtu\.be)\//i.test(query)
     ? query
     : `ytsearch1:${query}`;
@@ -102,64 +118,83 @@ async function ytInfo(query) {
     noWarnings: true,
     noCheckCertificates: true,
     noPlaylist: true,
-    extractorArgs: "youtube:player_client=web,android_vr,tv_downgraded"
+    extractorArgs: "youtube:player_client=web_safari"
   });
 
   const entry = data.entries?.[0] || data;
-  if (!entry || !entry.id && !entry.webpage_url && !entry.url) {
-    throw new Error("No results found.");
+  if (!entry || (!entry.id && !entry.webpage_url && !entry.url)) {
+    throw new Error("No YouTube result found.");
   }
-
-  const url = entry.webpage_url || entry.url ||
-    `https://www.youtube.com/watch?v=${entry.id}`;
 
   return {
     title: entry.title || "Unknown title",
-    url,
+    url: entry.webpage_url || entry.url || `https://www.youtube.com/watch?v=${entry.id}`,
     duration: entry.duration_string || entry.duration || "unknown"
   };
 }
 
-async function getAudioUrl(url) {
-  const output = await youtubedl(url, {
-    getUrl: true,
-    format: "bestaudio[ext=webm][acodec=opus]/bestaudio[ext=webm]/bestaudio",
-    noPlaylist: true,
-    noWarnings: true,
-    noCheckCertificates: true,
-    extractorArgs: "youtube:player_client=web,android_vr,tv_downgraded"
-  });
+function startAudioProcess(url) {
+  const bin = path.join(__dirname, "node_modules", "youtube-dl-exec", "bin", "yt-dlp");
 
-  const audioUrl = String(output).trim().split(/\r?\n/).filter(Boolean).pop();
-  if (!audioUrl || !audioUrl.startsWith("http")) {
-    throw new Error("Could not get an audio stream from YouTube.");
-  }
-  return audioUrl;
+  // web_safari is used because yt-dlp currently documents HLS formats from
+  // this client as a route that can avoid the GVS PO-token requirement.
+  // We ask yt-dlp to write the selected audio stream to stdout.
+  return spawn(bin, [
+    url,
+    "--no-playlist",
+    "--quiet",
+    "--no-warnings",
+    "--no-check-certificates",
+    "--format", "bestaudio/best",
+    "--extractor-args", "youtube:player_client=web_safari",
+    "--output", "-"
+  ], {
+    stdio: ["ignore", "pipe", "pipe"]
+  });
 }
 
 async function playCurrent(guildId) {
-  const state = getGuild(guildId);
+  const state = getState(guildId);
   if (!state.current) return;
 
-  if (state.sourceProcess) {
-    try { state.sourceProcess.kill("SIGKILL"); } catch {}
-    state.sourceProcess = null;
+  if (state.process) {
+    try { state.process.kill("SIGKILL"); } catch {}
+    state.process = null;
   }
 
-  const audioUrl = await getAudioUrl(state.current.url);
+  const proc = startAudioProcess(state.current.url);
+  state.process = proc;
 
-  const resource = createAudioResource(audioUrl, {
+  proc.stderr.on("data", d => {
+    const text = d.toString().trim();
+    if (text) console.log(`[yt-dlp] ${text}`);
+  });
+
+  proc.on("error", err => {
+    console.error("yt-dlp process error:", err);
+    state.process = null;
+  });
+
+  proc.on("close", code => {
+    state.process = null;
+    if (code && state.player.state.status !== AudioPlayerStatus.Idle) {
+      console.error(`yt-dlp exited with code ${code}`);
+      state.player.stop();
+    }
+  });
+
+  const resource = createAudioResource(proc.stdout, {
     inputType: StreamType.WebmOpus,
     inlineVolume: true
   });
 
+  resource.volume.setVolume(state.volume / 100);
   state.resource = resource;
-  state.resource.volume.setVolume(state.volume / 100);
-  state.player.play(state.resource);
+  state.player.play(resource);
 }
 
 async function playNext(guildId) {
-  const state = getGuild(guildId);
+  const state = getState(guildId);
   if (state.current || !state.queue.length) return;
 
   state.current = state.queue.shift();
@@ -177,24 +212,30 @@ client.once("ready", async () => {
     }]
   });
 
-  await client.application.commands.set(commands, process.env.GUILD_ID);
-  console.log("Registered /sb commands.");
+  if (process.env.GUILD_ID) {
+    await client.application.commands.set(commands, process.env.GUILD_ID);
+    console.log("Registered /sb commands in GUILD_ID.");
+  } else {
+    await client.application.commands.set(commands);
+    console.log("Registered global /sb commands.");
+  }
+
   console.log("Presence set to Idle.");
 });
 
 client.on("interactionCreate", async interaction => {
   if (!interaction.isChatInputCommand() || interaction.commandName !== "sb") return;
 
-  const state = getGuild(interaction.guildId);
+  const state = getState(interaction.guildId);
   const sub = interaction.options.getSubcommand();
 
   try {
     if (sub === "play") {
       await interaction.deferReply();
-      await ensureConnection(interaction, state);
 
+      await ensureConnection(interaction, state);
       const query = interaction.options.getString("query", true);
-      const track = await ytInfo(query);
+      const track = await getTrack(query);
 
       state.queue.push(track);
       if (!state.current) await playNext(interaction.guildId);
@@ -223,6 +264,10 @@ client.on("interactionCreate", async interaction => {
       state.queue = [];
       state.current = null;
       state.loop = false;
+      if (state.process) {
+        try { state.process.kill("SIGKILL"); } catch {}
+        state.process = null;
+      }
       state.player.stop();
       return interaction.reply("⏹️ Stopped and cleared the queue.");
     }
@@ -236,16 +281,13 @@ client.on("interactionCreate", async interaction => {
         .map((t, i) => `${i + 1}. ${t.title}`)
         .join("\n");
 
-      return interaction.reply(`${now}${list ? `\n\n📋 Queue:\n${list}` : ""}`);
+      return interaction.reply(`${now}${list ? `\n📋 Queue:\n${list}` : ""}`);
     }
 
     if (sub === "volume") {
       const volume = interaction.options.getInteger("percent", true);
       state.volume = volume;
-
-      if (state.resource?.volume)
-        state.resource.volume.setVolume(volume / 100);
-
+      if (state.resource?.volume) state.resource.volume.setVolume(volume / 100);
       return interaction.reply(`🔊 Volume set to **${volume}%**.`);
     }
 
@@ -258,9 +300,15 @@ client.on("interactionCreate", async interaction => {
       state.queue = [];
       state.current = null;
       state.loop = false;
+
+      if (state.process) {
+        try { state.process.kill("SIGKILL"); } catch {}
+        state.process = null;
+      }
+
       state.player.stop();
       state.connection?.destroy();
-      guilds.delete(interaction.guildId);
+      states.delete(interaction.guildId);
 
       return interaction.reply("👋 Left the voice channel.");
     }
