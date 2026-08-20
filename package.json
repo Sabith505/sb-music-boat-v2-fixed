@@ -1,13 +1,15 @@
 {
   "name": "sb-music-bot-v2",
-  "version": "2.0.0",
-  "description": "SB Discord music bot with search, queue, volume and loop",
+  "version": "2.1.0",
+  "description": "SB Discord music bot with YouTube playback, queue, volume, loop and idle presence",
   "main": "index.js",
-  "scripts": { "start": "node index.js" },
+  "scripts": {
+    "start": "node index.js"
+  },
   "dependencies": {
     "discord.js": "^14.21.0",
     "@discordjs/voice": "^0.18.0",
     "dotenv": "^17.2.1",
-    "play-dl": "^1.9.7"
+    "youtube-dl-exec": "^3.1.12"
   }
 }
