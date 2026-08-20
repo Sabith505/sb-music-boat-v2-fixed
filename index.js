@@ -9,6 +9,7 @@ const {
   SlashCommandBuilder,
   ActivityType
 } = require("discord.js");
+
 const {
   joinVoiceChannel,
   createAudioPlayer,
@@ -18,8 +19,8 @@ const {
   VoiceConnectionStatus,
   StreamType,
   entersState
-  
 } = require("@discordjs/voice");
+
 const youtubedl = require("youtube-dl-exec");
 
 const PORT = process.env.PORT || 10000;
@@ -88,6 +89,7 @@ function getState(guildId) {
     player.on("error", e => console.error("Audio player error:", e));
     states.set(guildId, state);
   }
+
   return states.get(guildId);
 }
 
@@ -112,41 +114,57 @@ async function getTrack(query) {
     ? query
     : `ytsearch1:${query}`;
 
-  const data = await youtubedl(target, {
-    dumpSingleJson: true,
-    flatPlaylist: true,
-    noWarnings: true,
-    noCheckCertificates: true,
-    noPlaylist: true,
-    extractorArgs: "youtube:player_client=web_safari"
-  });
+  try {
+    const data = await youtubedl(target, {
+      dumpSingleJson: true,
+      flatPlaylist: true,
+      noWarnings: true,
+      noCheckCertificates: true,
+      noPlaylist: true,
+      extractorArgs: "youtube:player_client=android_vr,web_safari"
+    });
 
-  const entry = data.entries?.[0] || data;
-  if (!entry || (!entry.id && !entry.webpage_url && !entry.url)) {
-    throw new Error("No YouTube result found.");
+    const entry = data.entries?.[0] || data;
+
+    if (!entry || (!entry.id && !entry.webpage_url && !entry.url)) {
+      throw new Error("No YouTube result found.");
+    }
+
+    return {
+      title: entry.title || "Unknown title",
+      url: entry.webpage_url || entry.url || `https://www.youtube.com/watch?v=${entry.id}`,
+      duration: entry.duration_string || entry.duration || "unknown"
+    };
+  } catch (err) {
+    const detail = String(err.stderr || err.message || err);
+
+    if (/sign in to confirm|not a bot|bot/i.test(detail)) {
+      throw new Error(
+        "YouTube is blocking this server request. Try another YouTube video or use a non-YouTube source."
+      );
+    }
+
+    throw err;
   }
-
-  return {
-    title: entry.title || "Unknown title",
-    url: entry.webpage_url || entry.url || `https://www.youtube.com/watch?v=${entry.id}`,
-    duration: entry.duration_string || entry.duration || "unknown"
-  };
 }
 
 function startAudioProcess(url) {
-  const bin = path.join(__dirname, "node_modules", "youtube-dl-exec", "bin", "yt-dlp");
+  const bin = path.join(
+    __dirname,
+    "node_modules",
+    "youtube-dl-exec",
+    "bin",
+    "yt-dlp"
+  );
 
-  // web_safari is used because yt-dlp currently documents HLS formats from
-  // this client as a route that can avoid the GVS PO-token requirement.
-  // We ask yt-dlp to write the selected audio stream to stdout.
   return spawn(bin, [
     url,
     "--no-playlist",
     "--quiet",
     "--no-warnings",
     "--no-check-certificates",
-    "--format", "bestaudio/best",
-    "--extractor-args", "youtube:player_client=web_safari",
+    "--format", "bestaudio[ext=webm]/bestaudio/best",
+    "--extractor-args", "youtube:player_client=android_vr,web_safari",
     "--output", "-"
   ], {
     stdio: ["ignore", "pipe", "pipe"]
@@ -234,11 +252,15 @@ client.on("interactionCreate", async interaction => {
       await interaction.deferReply();
 
       await ensureConnection(interaction, state);
+
       const query = interaction.options.getString("query", true);
       const track = await getTrack(query);
 
       state.queue.push(track);
-      if (!state.current) await playNext(interaction.guildId);
+
+      if (!state.current) {
+        await playNext(interaction.guildId);
+      }
 
       return interaction.editReply(`🎵 Added: **${track.title}**`);
     }
@@ -255,8 +277,10 @@ client.on("interactionCreate", async interaction => {
 
     if (sub === "skip") {
       if (!state.current) return interaction.reply("❌ Nothing is playing.");
+
       state.loop = false;
       state.player.stop();
+
       return interaction.reply("⏭️ Skipped.");
     }
 
@@ -264,36 +288,54 @@ client.on("interactionCreate", async interaction => {
       state.queue = [];
       state.current = null;
       state.loop = false;
+
       if (state.process) {
         try { state.process.kill("SIGKILL"); } catch {}
         state.process = null;
       }
+
       state.player.stop();
+
       return interaction.reply("⏹️ Stopped and cleared the queue.");
     }
 
     if (sub === "queue") {
-      if (!state.current && !state.queue.length)
+      if (!state.current && !state.queue.length) {
         return interaction.reply("📭 Queue is empty.");
+      }
 
-      const now = state.current ? `🎵 Now: **${state.current.title}**\n` : "";
-      const list = state.queue.slice(0, 10)
+      const now = state.current
+        ? `🎵 Now: **${state.current.title}**\n`
+        : "";
+
+      const list = state.queue
+        .slice(0, 10)
         .map((t, i) => `${i + 1}. ${t.title}`)
         .join("\n");
 
-      return interaction.reply(`${now}${list ? `\n📋 Queue:\n${list}` : ""}`);
+      return interaction.reply(
+        `${now}${list ? `\n📋 Queue:\n${list}` : ""}`
+      );
     }
 
     if (sub === "volume") {
       const volume = interaction.options.getInteger("percent", true);
+
       state.volume = volume;
-      if (state.resource?.volume) state.resource.volume.setVolume(volume / 100);
+
+      if (state.resource?.volume) {
+        state.resource.volume.setVolume(volume / 100);
+      }
+
       return interaction.reply(`🔊 Volume set to **${volume}%**.`);
     }
 
     if (sub === "loop") {
       state.loop = !state.loop;
-      return interaction.reply(state.loop ? "🔁 Loop enabled." : "➡️ Loop disabled.");
+
+      return interaction.reply(
+        state.loop ? "🔁 Loop enabled." : "➡️ Loop disabled."
+      );
     }
 
     if (sub === "leave") {
@@ -314,6 +356,7 @@ client.on("interactionCreate", async interaction => {
     }
   } catch (e) {
     console.error(e);
+
     const msg = `❌ ${e.message || "Something went wrong."}`;
 
     if (interaction.deferred) return interaction.editReply(msg);
