@@ -1,222 +1,118 @@
 require("dotenv").config();
 
 const http = require("http");
-const path = require("path");
-const { spawn } = require("child_process");
 const {
   Client,
   GatewayIntentBits,
-  SlashCommandBuilder,
-  ActivityType
+  ActivityType,
+  SlashCommandBuilder
 } = require("discord.js");
-
-const {
-  joinVoiceChannel,
-  createAudioPlayer,
-  createAudioResource,
-  AudioPlayerStatus,
-  NoSubscriberBehavior,
-  VoiceConnectionStatus,
-  StreamType,
-  entersState
-} = require("@discordjs/voice");
-
-const youtubedl = require("youtube-dl-exec");
+const { Connectors } = require("shoukaku");
+const { Kazagumo } = require("kazagumo");
 
 const PORT = process.env.PORT || 10000;
+const NODE_API = "https://lavalink-list.ajieblogs.eu.org/servers";
 
 http.createServer((req, res) => {
-  res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("SB Music Bot is online");
+  res.writeHead(200, {"Content-Type": "text/plain"});
+  res.end("SB Boom Box is online.");
 }).listen(PORT, "0.0.0.0", () => {
   console.log(`HTTP server listening on ${PORT}`);
 });
-
-const commands = [
-  new SlashCommandBuilder()
-    .setName("sb")
-    .setDescription("SB music commands")
-    .addSubcommand(s => s.setName("play").setDescription("Play a song or YouTube URL")
-      .addStringOption(o => o.setName("query").setDescription("Song name or URL").setRequired(true)))
-    .addSubcommand(s => s.setName("pause").setDescription("Pause"))
-    .addSubcommand(s => s.setName("resume").setDescription("Resume"))
-    .addSubcommand(s => s.setName("skip").setDescription("Skip"))
-    .addSubcommand(s => s.setName("stop").setDescription("Stop and clear queue"))
-    .addSubcommand(s => s.setName("queue").setDescription("Show queue"))
-    .addSubcommand(s => s.setName("volume").setDescription("Set volume 1-100")
-      .addIntegerOption(o => o.setName("percent").setDescription("Volume percent").setRequired(true).setMinValue(1).setMaxValue(100)))
-    .addSubcommand(s => s.setName("loop").setDescription("Toggle loop for current song"))
-    .addSubcommand(s => s.setName("leave").setDescription("Leave voice channel"))
-].map(c => c.toJSON());
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates]
 });
 
-const states = new Map();
+const commands = [
+  new SlashCommandBuilder()
+    .setName("sb")
+    .setDescription("SB Boom Box music")
+    .addSubcommand(s => s.setName("play").setDescription("Play/search a song")
+      .addStringOption(o => o.setName("query").setDescription("Song name or URL").setRequired(true)))
+    .addSubcommand(s => s.setName("pause").setDescription("Pause playback"))
+    .addSubcommand(s => s.setName("resume").setDescription("Resume playback"))
+    .addSubcommand(s => s.setName("skip").setDescription("Skip current song"))
+    .addSubcommand(s => s.setName("stop").setDescription("Stop and clear queue"))
+    .addSubcommand(s => s.setName("queue").setDescription("Show queue"))
+    .addSubcommand(s => s.setName("volume").setDescription("Set volume")
+      .addIntegerOption(o => o.setName("percent").setDescription("1-100").setRequired(true).setMinValue(1).setMaxValue(100)))
+    .addSubcommand(s => s.setName("loop").setDescription("Toggle current-song loop"))
+    .addSubcommand(s => s.setName("leave").setDescription("Leave voice channel"))
+].map(x => x.toJSON());
 
-function getState(guildId) {
-  if (!states.has(guildId)) {
-    const player = createAudioPlayer({
-      behaviors: { noSubscriber: NoSubscriberBehavior.Pause }
+async function discoverNodes() {
+  const response = await fetch(NODE_API);
+  if (!response.ok) throw new Error(`Public Lavalink API returned ${response.status}`);
+
+  const data = await response.json();
+  const list = Array.isArray(data) ? data : (data.nodes || data.servers || []);
+
+  const nodes = [];
+  for (const n of list) {
+    const host = n.host || n.hostname || n.ip;
+    const port = Number(n.port || (n.url ? new URL(n.url).port : 443));
+    const secure = n.secure ?? n.ssl ?? (n.url ? new URL(n.url).protocol === "https:" : true);
+    const password = n.password || n.auth || "youshallnotpass";
+
+    if (!host || !port) continue;
+    nodes.push({
+      name: `public-${host}-${port}`,
+      url: `${host}:${port}`,
+      auth: password,
+      secure: !!secure
     });
+  }
 
-    const state = {
-      player,
-      connection: null,
-      queue: [],
-      current: null,
-      loop: false,
-      volume: 80,
-      resource: null,
-      process: null
-    };
+  // Allow a manual public node as a fallback if the public directory changes.
+  if (!nodes.length && process.env.LAVALINK_HOST) {
+    nodes.push({
+      name: "manual",
+      url: `${process.env.LAVALINK_HOST}:${process.env.LAVALINK_PORT || 443}`,
+      auth: process.env.LAVALINK_PASSWORD || "youshallnotpass",
+      secure: process.env.LAVALINK_SECURE !== "false"
+    });
+  }
 
-    player.on(AudioPlayerStatus.Idle, () => {
-      if (state.process) {
-        try { state.process.kill("SIGKILL"); } catch {}
-        state.process = null;
+  if (!nodes.length) throw new Error("No public Lavalink nodes were returned.");
+  return nodes.slice(0, 8);
+}
+
+let kazagumo;
+
+async function startMusic() {
+  const nodes = await discoverNodes();
+  console.log(`Discovered ${nodes.length} public Lavalink node(s).`);
+
+  kazagumo = new Kazagumo(
+    {
+      defaultSearchEngine: "ytmsearch",
+      send: (guildId, payload) => {
+        const guild = client.guilds.cache.get(guildId);
+        if (guild) guild.shard.send(payload);
       }
-
-      if (state.loop && state.current) {
-        playCurrent(guildId).catch(console.error);
-      } else {
-        state.current = null;
-        playNext(guildId).catch(console.error);
-      }
-    });
-
-    player.on("error", e => console.error("Audio player error:", e));
-    states.set(guildId, state);
-  }
-
-  return states.get(guildId);
-}
-
-async function ensureConnection(interaction, state) {
-  const channel = interaction.member?.voice?.channel;
-  if (!channel) throw new Error("Join a voice channel first.");
-
-  if (!state.connection) {
-    state.connection = joinVoiceChannel({
-      channelId: channel.id,
-      guildId: channel.guild.id,
-      adapterCreator: channel.guild.voiceAdapterCreator
-    });
-
-    await entersState(state.connection, VoiceConnectionStatus.Ready, 15000);
-    state.connection.subscribe(state.player);
-  }
-}
-
-async function getTrack(query) {
-  const target = /^https?:\/\/(www\.)?(youtube\.com|youtu\.be)\//i.test(query)
-    ? query
-    : `ytsearch1:${query}`;
-
-  try {
-    const data = await youtubedl(target, {
-      dumpSingleJson: true,
-      flatPlaylist: true,
-      noWarnings: true,
-      noCheckCertificates: true,
-      noPlaylist: true,
-      extractorArgs: "youtube:player_client=android_vr,web_safari"
-    });
-
-    const entry = data.entries?.[0] || data;
-
-    if (!entry || (!entry.id && !entry.webpage_url && !entry.url)) {
-      throw new Error("No YouTube result found.");
-    }
-
-    return {
-      title: entry.title || "Unknown title",
-      url: entry.webpage_url || entry.url || `https://www.youtube.com/watch?v=${entry.id}`,
-      duration: entry.duration_string || entry.duration || "unknown"
-    };
-  } catch (err) {
-    const detail = String(err.stderr || err.message || err);
-
-    if (/sign in to confirm|not a bot|bot/i.test(detail)) {
-      throw new Error(
-        "YouTube is blocking this server request. Try another YouTube video or use a non-YouTube source."
-      );
-    }
-
-    throw err;
-  }
-}
-
-function startAudioProcess(url) {
-  const bin = path.join(
-    __dirname,
-    "node_modules",
-    "youtube-dl-exec",
-    "bin",
-    "yt-dlp"
+    },
+    new Connectors.DiscordJS(client),
+    nodes
   );
 
-  return spawn(bin, [
-    url,
-    "--no-playlist",
-    "--quiet",
-    "--no-warnings",
-    "--no-check-certificates",
-    "--format", "bestaudio[ext=webm]/bestaudio/best",
-    "--extractor-args", "youtube:player_client=android_vr,web_safari",
-    "--output", "-"
-  ], {
-    stdio: ["ignore", "pipe", "pipe"]
-  });
+  kazagumo.shoukaku.on("ready", name => console.log(`Lavalink ready: ${name}`));
+  kazagumo.shoukaku.on("error", (name, err) => console.error(`Lavalink error ${name}:`, err));
+  kazagumo.shoukaku.on("disconnect", (name, count) =>
+    console.log(`Lavalink disconnected: ${name} (${count ?? 0})`));
+
+  kazagumo.on("playerStart", (player, track) =>
+    console.log(`[${player.guildId}] Playing: ${track.title}`));
+  kazagumo.on("playerEnd", (player, track) =>
+    console.log(`[${player.guildId}] Ended: ${track?.title || "unknown"}`));
+  kazagumo.on("playerEmpty", player =>
+    console.log(`[${player.guildId}] Queue empty.`));
 }
 
-async function playCurrent(guildId) {
-  const state = getState(guildId);
-  if (!state.current) return;
-
-  if (state.process) {
-    try { state.process.kill("SIGKILL"); } catch {}
-    state.process = null;
-  }
-
-  const proc = startAudioProcess(state.current.url);
-  state.process = proc;
-
-  proc.stderr.on("data", d => {
-    const text = d.toString().trim();
-    if (text) console.log(`[yt-dlp] ${text}`);
-  });
-
-  proc.on("error", err => {
-    console.error("yt-dlp process error:", err);
-    state.process = null;
-  });
-
-  proc.on("close", code => {
-    state.process = null;
-    if (code && state.player.state.status !== AudioPlayerStatus.Idle) {
-      console.error(`yt-dlp exited with code ${code}`);
-      state.player.stop();
-    }
-  });
-
-  const resource = createAudioResource(proc.stdout, {
-    inputType: StreamType.WebmOpus,
-    inlineVolume: true
-  });
-
-  resource.volume.setVolume(state.volume / 100);
-  state.resource = resource;
-  state.player.play(resource);
-}
-
-async function playNext(guildId) {
-  const state = getState(guildId);
-  if (state.current || !state.queue.length) return;
-
-  state.current = state.queue.shift();
-  await playCurrent(guildId);
+function voiceChannel(interaction) {
+  const channel = interaction.member?.voice?.channel;
+  if (!channel) throw new Error("Join a voice channel first.");
+  return channel;
 }
 
 client.once("ready", async () => {
@@ -224,141 +120,127 @@ client.once("ready", async () => {
 
   client.user.setPresence({
     status: "idle",
-    activities: [{
-      name: "/sb play",
-      type: ActivityType.Listening
-    }]
+    activities: [{ name: "/sb play", type: ActivityType.Listening }]
   });
 
   if (process.env.GUILD_ID) {
-    await client.application.commands.set(commands, process.env.GUILD_ID);
-    console.log("Registered /sb commands in GUILD_ID.");
+    const guild = client.guilds.cache.get(process.env.GUILD_ID);
+    if (guild) await guild.commands.set(commands);
+    else await client.application.commands.set(commands, process.env.GUILD_ID);
   } else {
     await client.application.commands.set(commands);
-    console.log("Registered global /sb commands.");
   }
 
+  console.log("Registered /sb commands.");
   console.log("Presence set to Idle.");
+
+  try {
+    await startMusic();
+  } catch (e) {
+    console.error("Could not start public Lavalink:", e);
+  }
 });
 
 client.on("interactionCreate", async interaction => {
   if (!interaction.isChatInputCommand() || interaction.commandName !== "sb") return;
 
-  const state = getState(interaction.guildId);
-  const sub = interaction.options.getSubcommand();
-
   try {
+    if (!kazagumo) return interaction.reply("⏳ Music system is still connecting. Try again in a few seconds.");
+
+    const sub = interaction.options.getSubcommand();
+
     if (sub === "play") {
       await interaction.deferReply();
 
-      await ensureConnection(interaction, state);
-
+      const vc = voiceChannel(interaction);
       const query = interaction.options.getString("query", true);
-      const track = await getTrack(query);
 
-      state.queue.push(track);
-
-      if (!state.current) {
-        await playNext(interaction.guildId);
+      let player = kazagumo.players.get(interaction.guildId);
+      if (!player) {
+        player = await kazagumo.createPlayer({
+          guildId: interaction.guildId,
+          textId: interaction.channelId,
+          voiceId: vc.id,
+          deaf: true
+        });
+      } else if (player.voiceId !== vc.id) {
+        player.setVoiceChannel(vc.id);
       }
+
+      const result = await kazagumo.search(
+        /^https?:\/\//i.test(query) ? query : `ytmsearch:${query}`,
+        { requester: interaction.user }
+      );
+
+      if (!result.tracks?.length) return interaction.editReply("❌ No results found.");
+
+      if (result.type === "PLAYLIST") {
+        player.queue.add(result.tracks);
+        if (!player.playing && !player.paused) await player.play();
+        return interaction.editReply(`📋 Added **${result.tracks.length}** tracks.`);
+      }
+
+      const track = result.tracks[0];
+      player.queue.add(track);
+      if (!player.playing && !player.paused) await player.play();
 
       return interaction.editReply(`🎵 Added: **${track.title}**`);
     }
 
+    const player = kazagumo.players.get(interaction.guildId);
+
+    if (sub === "leave") {
+      if (player) player.destroy();
+      return interaction.reply("👋 Left the voice channel.");
+    }
+
+    if (!player) return interaction.reply("❌ Nothing is playing.");
+
     if (sub === "pause") {
-      state.player.pause();
+      await player.pause(true);
       return interaction.reply("⏸️ Paused.");
     }
 
     if (sub === "resume") {
-      state.player.unpause();
+      await player.pause(false);
       return interaction.reply("▶️ Resumed.");
     }
 
     if (sub === "skip") {
-      if (!state.current) return interaction.reply("❌ Nothing is playing.");
-
-      state.loop = false;
-      state.player.stop();
-
+      await player.skip();
       return interaction.reply("⏭️ Skipped.");
     }
 
     if (sub === "stop") {
-      state.queue = [];
-      state.current = null;
-      state.loop = false;
-
-      if (state.process) {
-        try { state.process.kill("SIGKILL"); } catch {}
-        state.process = null;
-      }
-
-      state.player.stop();
-
+      player.queue.clear();
+      await player.stop();
       return interaction.reply("⏹️ Stopped and cleared the queue.");
     }
 
     if (sub === "queue") {
-      if (!state.current && !state.queue.length) {
-        return interaction.reply("📭 Queue is empty.");
-      }
+      const current = player.queue.current;
+      const tracks = player.queue.slice(0, 10);
+      if (!current && !tracks.length) return interaction.reply("📭 Queue is empty.");
 
-      const now = state.current
-        ? `🎵 Now: **${state.current.title}**\n`
-        : "";
-
-      const list = state.queue
-        .slice(0, 10)
-        .map((t, i) => `${i + 1}. ${t.title}`)
-        .join("\n");
-
-      return interaction.reply(
-        `${now}${list ? `\n📋 Queue:\n${list}` : ""}`
-      );
+      let out = current ? `🎵 Now: **${current.title}**\n` : "";
+      if (tracks.length) out += "\n📋 Queue:\n" + tracks.map((t, i) => `${i + 1}. ${t.title}`).join("\n");
+      return interaction.reply(out);
     }
 
     if (sub === "volume") {
       const volume = interaction.options.getInteger("percent", true);
-
-      state.volume = volume;
-
-      if (state.resource?.volume) {
-        state.resource.volume.setVolume(volume / 100);
-      }
-
+      await player.setVolume(volume);
       return interaction.reply(`🔊 Volume set to **${volume}%**.`);
     }
 
     if (sub === "loop") {
-      state.loop = !state.loop;
-
-      return interaction.reply(
-        state.loop ? "🔁 Loop enabled." : "➡️ Loop disabled."
-      );
-    }
-
-    if (sub === "leave") {
-      state.queue = [];
-      state.current = null;
-      state.loop = false;
-
-      if (state.process) {
-        try { state.process.kill("SIGKILL"); } catch {}
-        state.process = null;
-      }
-
-      state.player.stop();
-      state.connection?.destroy();
-      states.delete(interaction.guildId);
-
-      return interaction.reply("👋 Left the voice channel.");
+      const enabled = player.loop === "track";
+      player.setLoop(enabled ? "none" : "track");
+      return interaction.reply(enabled ? "➡️ Loop disabled." : "🔁 Loop enabled.");
     }
   } catch (e) {
     console.error(e);
-
-    const msg = `❌ ${e.message || "Something went wrong."}`;
-
+    const msg = `❌ ${e.message || "Music error."}`;
     if (interaction.deferred) return interaction.editReply(msg);
     if (!interaction.replied) return interaction.reply(msg);
   }
